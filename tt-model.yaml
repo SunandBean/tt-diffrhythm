@@ -1,0 +1,124 @@
+schema: "5.1"
+repo: sunandbean/diffrhythm-1.2-p100a
+name: diffrhythm-1.2-p100a
+# DiffRhythm publishes the CFM checkpoint, the stable-audio VAE and the MuQ-MuLan style encoder as
+# three repos. `weights:` names the one that identifies the model; the server resolves the other
+# two through hf_hub_download on first load, into the same HF cache.
+weights:
+  repo: ASLP-lab/DiffRhythm-1_2-full
+kind: tt-dit-server
+arch: blackhole
+
+image:
+  registry: hf
+
+source:
+  tt_metal: {repo: https://github.com/tenstorrent/tt-metal, ref: v0.80.0-dev20260921}
+  code:
+    # Every port in this family reaches tt-metal for `models.tt_dit.utils.matmul.get_matmul_config`.
+    # The module guards that import and falls back to None, so an under-listed allowlist builds and
+    # loads cleanly and only fails on the first matmul -- list it rather than discover that at serve.
+    - models/common
+    - models/tt_dit
+  extra_code:
+    - root: {repo: https://github.com/SunandBean/tt-diffrhythm, ref: v0.1.4}
+      paths: [tt_diffrhythm]
+    # DiffRhythm itself (Apache-2.0). It is the model: this port only moves its CFM transformer and
+    # its stable-audio VAE decoder onto the card, and every other stage is upstream's own code
+    # running unchanged. Shipped as source because upstream is a research checkout with no
+    # packaging, and because its requirements pin torch 2.10.0+cu128, a CUDA build that cannot be
+    # installed beside ttnn. This image resolves torch 2.14.1+cpu with numpy 2.5.3.
+    - root: {repo: https://github.com/ASLP-lab/DiffRhythm, ref: 28ad63c0f096fe2ee258bcabbcf081d5d9366afd}
+      # `dataset` is here only because upstream `model/__init__.py` imports its trainer, which
+      # imports the dataset module; nothing in this server touches either.
+      paths: [model, infer, g2p, config, dataset, thirdparty]
+  ubuntu: "22.04"
+  python: "3.12"
+
+runtime:
+  app: tt_diffrhythm.server:app
+  mesh_shape_env: DIFFRHYTHM_MESH_SHAPE
+  packages:
+    # DiffRhythm's own dependencies, minus the CUDA torch stack it pins and minus the training
+    # and dataset extras this server never reaches.
+    - torchaudio==2.11.0+cpu
+    - torchdiffeq
+    - x-transformers
+    - transformers
+    - librosa
+    - soundfile
+    - muq
+    - mutagen
+    - ema-pytorch
+    - accelerate
+    - einops
+    - tqdm
+    # likewise only reached through upstream `model/__init__.py` -> trainer
+    - wandb
+    - scipy
+    - numpy
+    - huggingface_hub
+    # the lyric tokenizer's phoneme pipeline
+    - phonemizer
+    # phonemizer needs libespeak-ng, which is a system package everywhere except here: this wheel
+    # carries the library and its data, and the server points phonemizer at them before importing
+    # upstream's g2p module.
+    - espeakng-loader
+    - pykakasi
+    - jieba
+    # the g2p chain loads an ONNX model for its language id step
+    - onnxruntime
+    - cn2an
+    - pypinyin
+    - Unidecode
+    - inflect
+    # pinned: upstream's vendored LangSegment calls LanguageIdentifier.from_pickled_model,
+    # which 0.3 removed
+    - py3langid==0.2.2
+
+serve:
+  port: 8000
+  hardware: p100a
+  mesh_device: P100
+  env:
+    ARCH_NAME: blackhole
+    # A song's 62 DiT calls are sub-second each; the long pole is the VAE decoder's conv kernels,
+    # compiled once per window at startup.
+    TT_METAL_OPERATION_TIMEOUT_SECONDS: "600.0"
+
+verify:
+  - "import tt_diffrhythm.server as s; assert s.app"
+  - "from tt_diffrhythm.local import LocalWorker; assert LocalWorker"
+  # upstream is a research checkout: it is imported from the working directory and reaches
+  # sideways (model/__init__ pulls in its trainer, which pulls in the dataset module). Walk the
+  # server's own entry path here so a missing tree fails the build, not the first request.
+  - "import tt_diffrhythm.server as s; s._enter_checkout(); import infer_utils, model; assert model.CFM and infer_utils.load_checkpoint"
+  # Both of these are read by upstream through a relative path, so they only resolve from the
+  # working directory the server enters -- each verify line is its own process, so enter it here.
+  - "from tt_diffrhythm.server import _enter_checkout; _enter_checkout(); import os; assert os.path.isfile('infer/example/vocal.npy'), 'the negative style prompt did not ship'"
+  - "from tt_diffrhythm.server import _enter_checkout; _enter_checkout(); import json; assert json.load(open('config/diffrhythm-1b.json'))['model']"
+  # Build the lyric tokenizer for real. Its __init__ is where upstream's g2p chain is imported --
+  # espeak, the phoneme vocabulary and the ONNX language-id model all have to be present, and none
+  # of that is visible from an import of infer_utils alone.
+  - "from tt_diffrhythm.server import _enter_checkout; _enter_checkout(); from infer_utils import CNENTokenizer; assert CNENTokenizer().encode('a quiet morning')"
+  # upstream's g2p builds its EspeakBackends at import, so espeak has to resolve before upstream
+  # is imported at all. Run the server's own wiring here and then phonemize something.
+  - "from tt_diffrhythm.server import _point_phonemizer_at_a_bundled_espeak as fix; fix(); from phonemizer.backend import EspeakBackend; assert EspeakBackend('en-us').phonemize(['hello'])[0].strip()"
+
+card:
+  description: >
+    DiffRhythm 1.2 Full text-to-music, ported to one Tenstorrent Blackhole p100a. The CFM
+    transformer and the stable-audio VAE decoder run on the card; DiffRhythm's own sampling loop
+    runs unchanged on the CPU in the same process. Weights are Apache-2.0 from ASLP-lab and are
+    never redistributed here.
+  quickstart: |
+    ### Request shape
+
+    `POST /predict` takes `{"prompt": str, "lyrics": str, "instrumental": bool,
+    "duration": int, "seed": int}` and returns a base64 WAV with `timing_s` and the `lrc` the
+    song was actually sung to.
+
+    `prompt` is the style description. Vocals need `lyrics`: real LRC is used as given, and
+    plain lines get approximate starts derived from their word counts -- a convenience, not
+    learned alignment. `duration` is 96-285 seconds; use the ACE-Step port for longer songs.
+    The schedule is fixed at **32 steps**; any other `inference_steps` is a 422.

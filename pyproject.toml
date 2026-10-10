@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tt-diffrhythm"
+version = "0.1.0"
+description = "DiffRhythm 1.2 Full on one Tenstorrent Blackhole p100a"
+readme = "PYTHON.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# ttnn / tt-metal is not on PyPI: it comes from the tt-metal environment this runs in.
+dependencies = [
+    "torch",
+    "numpy",
+    "safetensors",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["tt_diffrhythm*"]
